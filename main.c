@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -9,7 +10,6 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <assert.h>
 
 // kqueue
 #include <sys/event.h>
@@ -20,16 +20,73 @@
 #define TYPE_LISTENER 0
 #define TYPE_CONN 1
 
+// returns
+#define RES_ERR -1
+#define RES_AGAIN -2
+#define RES_CLOSED -3
+
+/*
+ * Sock
+ */
+
+struct sock_t {
+  int type;
+  int fd;
+};
+
+ssize_t sock_read(struct sock_t *sock, void *buf, size_t len) {
+  ssize_t n;
+
+eintr:
+  n = read(sock->fd, buf, len);
+
+  if (n == -1) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      return RES_AGAIN;
+    } else if (errno == EINTR) {
+      goto eintr;
+    } else {
+      return RES_ERR;
+    }
+  } else if (n == 0) {
+    return RES_CLOSED;
+  }
+
+  return n;
+}
+
+ssize_t sock_write(struct sock_t *sock, void *buf, size_t len) {
+  ssize_t n;
+
+eintr:
+  n = write(sock->fd, buf, len);
+
+  if (n == -1) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      return RES_AGAIN;
+    } else if (errno == EINTR) {
+      goto eintr;
+    } else {
+      return RES_ERR;
+    }
+  }
+
+  return n;
+}
+
 /*
  * Connection primitives
  */
 
+#define CONN_READ_CLOSED (1 << 1)
+#define CONN_READABLE (1 << 2)
+#define CONN_WRITABLE (1 << 3)
+
 struct conn_t {
-  int type;
-  int fd;
+  struct sock_t sock;
   char *buf;
   int size;
-  int eof;
+  int state;
 };
 
 struct conn_t *create_conn(int sock) {
@@ -42,149 +99,83 @@ struct conn_t *create_conn(int sock) {
     free(new_conn);
     return NULL;
   }
-  new_conn->type = TYPE_CONN;
-  new_conn->fd = sock;
+  new_conn->sock.type = TYPE_CONN;
+  new_conn->sock.fd = sock;
   new_conn->size = 0;
-  new_conn->eof = 0;
+  new_conn->state = CONN_READABLE | CONN_WRITABLE;
   return new_conn;
 }
 
 // TODO: must check read or write (other) event is cached
 void delete_conn(struct conn_t *conn) {
-  close(conn->fd);
+  close(conn->sock.fd);
   free(conn->buf);
   free(conn);
-}
-
-int read_conn(struct conn_t *conn) {
-  ssize_t nn = 0;
-  while(conn->size < BUFSIZE) {
-    ssize_t n;
-    n = read(conn->fd, conn->buf + conn->size, BUFSIZE - conn->size);
-    if (n == -1) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        break;
-      } else if (errno == EINTR) {
-        continue;
-      } else {
-        return -1;
-      }
-    } else if (n == 0) {
-      conn->eof = 1;
-      break;
-    }
-    nn += n;
-    conn->size += n;
-  }
-  return nn;
-}
-
-int write_conn(struct conn_t *conn) {
-  ssize_t offset = 0, n;
-  while(conn->size > 0) {
-    n = write(conn->fd, conn->buf + offset, conn->size);
-    if (n == -1) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        break;
-      } else if (errno == EINTR) {
-        continue;
-      }
-      return -1;
-    }
-    conn->size -= n;
-    offset += n;
-  }
-  if (conn->size > 0) {
-    memmove(conn->buf, conn->buf + offset, conn->size);
-  }
-  return offset;
 }
 
 /*
  * Handlers
  */
 
-void handle_read(int kq, struct conn_t *conn) {
-  while (1) {
-    if (read_conn(conn) == -1) {
-      perror("read");
-      delete_conn(conn);
-      return;
-    }
-    if (conn->size == 0) {
-      if (conn->eof) {
-        // fprintf(stderr, "finish conn : %d\n", conn->fd);
-        delete_conn(conn);
-        return;
+int handler(struct conn_t *conn) {
+  int changed = 0;
+  struct kevent ev;
+  ssize_t res;
+
+  while (conn->state & (CONN_READABLE | CONN_WRITABLE)) {
+    // read
+    if ((conn->state & CONN_READABLE) && conn->size < BUFSIZE) {
+      res = sock_read(&(conn->sock), conn->buf + conn->size,
+                      BUFSIZE - conn->size);
+      if (res == RES_ERR) {
+        perror("read");
+        return RES_ERR;
+      } else if (res == RES_CLOSED) {
+        if (conn->size == 0) {
+          return RES_CLOSED;
+        }
+        conn->state &= ~CONN_READABLE;
+        conn->state |= CONN_READ_CLOSED;
+      } else if (res == RES_AGAIN) {
+        conn->state &= ~CONN_READABLE;
+        changed |= CONN_READABLE;
+      } else {
+        conn->size += res;
       }
-      // wait for next read event
-      return;
+    } else if ((conn->state & CONN_WRITABLE) == 0) {
+      // readable but buffer is full and not writable
+      break;
     }
 
-    if (write_conn(conn) == -1) {
-      perror("write");
-      delete_conn(conn);
-      return;
-    } else if (conn->size > 0) {
-      struct kevent ev;
-
-      // set write event
-      EV_SET(&ev, conn->fd, EVFILT_WRITE, EV_ADD|EV_CLEAR, 0, 0, conn);
-      if (kevent(kq, &ev, 1, NULL, 0, NULL) == -1) {
-        perror("kevent-register");
-        delete_conn(conn);
-        return;
-      }
-
-      if (conn->size == BUFSIZE) {
-        // remove edge triggered read event
-        EV_SET(&ev, conn->fd, EVFILT_READ, EV_DELETE, 0, 0, conn);
-        if (kevent(kq, &ev, 1, NULL, 0, NULL) == -1) {
-          perror("kevent-register");
-          delete_conn(conn);
-          return;
+    // write
+    if ((conn->state & CONN_WRITABLE) && conn->size > 0) {
+      res = sock_write(&(conn->sock), conn->buf, conn->size);
+      if (res == RES_ERR) {
+        perror("write");
+        return RES_ERR;
+      } else if (res == RES_AGAIN) {
+        conn->state &= ~CONN_WRITABLE;
+        changed |= CONN_WRITABLE;
+      } else {
+        ssize_t offset = conn->size;
+        conn->size -= res;
+        if (conn->size > 0) {
+          memmove(conn->buf, conn->buf + offset, conn->size);
+          conn->state &= ~CONN_WRITABLE;
+          changed |= CONN_WRITABLE;
         }
       }
+    } else if ((conn->state & CONN_READABLE) == 0) {
+      // writable but buffer is empty and not readable
+      break;
+    }
+
+    // check closed
+    if (conn->size == 0 && conn->state & CONN_READ_CLOSED) {
+      return RES_CLOSED;
     }
   }
-}
-
-void handle_write(int kq, struct conn_t *conn) {
-  assert(conn->size > 0);
-
-  int prev = conn->size;
-  int n = write_conn(conn);
-  if (n == -1) {
-    perror("write");
-    delete_conn(conn);
-    return;
-  }
-  if (conn->eof && conn->size == 0) {
-    // have written all read data
-    // fprintf(stderr, "finish conn : %d\n", conn->fd);
-    delete_conn(conn);
-    return;
-  }
-
-  struct kevent ev;
-  if (prev == BUFSIZE && n > 0 && !conn->eof) {
-    // resume read
-    EV_SET(&ev, conn->fd, EVFILT_READ, EV_ADD|EV_CLEAR, 0, 0, conn);
-    if (kevent(kq, &ev, 1, NULL, 0, NULL) == -1) {
-      perror("kevent-register");
-      delete_conn(conn);
-      return;
-    }
-  }
-  if (n == prev) {
-    // remove write trigger
-    EV_SET(&ev, conn->fd, EVFILT_WRITE, EV_DELETE, 0, 0, conn);
-    if (kevent(kq, &ev, 1, NULL, 0, NULL) == -1) {
-      perror("kevent-register");
-      delete_conn(conn);
-      return;
-    }
-  }
+  return changed;
 }
 
 int main(int argc, char const *argv[]) {
@@ -199,7 +190,7 @@ int main(int argc, char const *argv[]) {
   int res;
   struct sockaddr_in laddr;
   laddr.sin_family = AF_INET;
-  laddr.sin_port = htons(3005);
+  laddr.sin_port = htons(3004);
   if ((res = inet_pton(AF_INET, laddrstr, &laddr.sin_addr)) <= 0) {
     if (res == 0) {
       fprintf(stderr, "invalid format for ipv4\n");
@@ -209,7 +200,7 @@ int main(int argc, char const *argv[]) {
     return 1;
   }
 
-  struct conn_t listener;
+  struct sock_t listener;
   listener.type = TYPE_LISTENER;
   if ((listener.fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
     perror("socket");
@@ -237,7 +228,8 @@ int main(int argc, char const *argv[]) {
   fprintf(stderr, "kqueue : %d\n", kq);
 
   struct kevent kevs[1];
-  EV_SET(&kevs[0], listener.fd, EVFILT_READ, EV_ADD|EV_CLEAR, 0, 0, &listener);
+  EV_SET(&kevs[0], listener.fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0,
+         &listener);
 
   res = kevent(kq, &kevs[0], 1, NULL, 0, NULL);
   if (res == -1) {
@@ -255,13 +247,13 @@ int main(int argc, char const *argv[]) {
 
     int i;
     for (i = 0; i < res; i++) {
-      struct conn_t *conn = (struct conn_t *)kevs[i].udata;
-      switch (conn->type) {
-        case TYPE_LISTENER:
+      struct sock_t *sock = (struct sock_t *)kevs[i].udata;
+      switch (sock->type) {
+        case TYPE_LISTENER: {
           // Listener
           while (1) {
-            int sock = accept(conn->fd, NULL, NULL);
-            if (sock == -1) {
+            int fd = accept(sock->fd, NULL, NULL);
+            if (fd == -1) {
               if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
               } else if (errno == EINTR) {
@@ -271,43 +263,108 @@ int main(int argc, char const *argv[]) {
               goto Finish;
             }
 
-            // fprintf(stderr, "accept sock : %d\n", sock);
-            fcntl(sock, F_SETFL, O_NONBLOCK);
+            fprintf(stderr, "accept sock : %d\n", fd);
+            fcntl(fd, F_SETFL, O_NONBLOCK);
 
-            struct conn_t *new_conn = create_conn(sock);
-            if (new_conn == NULL) {
+            struct conn_t *conn = create_conn(fd);
+            if (conn == NULL) {
 #define MALLOC_CONN_ERROR_MSG "failed to allocate memory for connection\n"
-              write(sock, MALLOC_CONN_ERROR_MSG, sizeof(MALLOC_CONN_ERROR_MSG));
+              write(fd, MALLOC_CONN_ERROR_MSG, sizeof(MALLOC_CONN_ERROR_MSG));
               fprintf(stderr, MALLOC_CONN_ERROR_MSG);
-              close(sock);
+              close(fd);
               continue;
             }
 
-            // register to kqueue
-            EV_SET(&kevs[0], new_conn->fd, EVFILT_READ, EV_ADD|EV_CLEAR, 0, 0, new_conn);
-            res = kevent(kq, &kevs[0], 1, NULL, 0, NULL);
-            if (res == -1) {
-              perror("kevent-register");
-              goto Finish;
+            int changed = handler(conn);
+            if (changed < 0) {
+              delete_conn(conn);
+            } else {
+              if (changed & CONN_READABLE) {
+                // resume read
+                EV_SET(&kevs[0], conn->sock.fd, EVFILT_READ, EV_ADD | EV_CLEAR,
+                       0, 0, conn);
+                if (kevent(kq, &kevs[0], 1, NULL, 0, NULL) == -1) {
+                  perror("kevent-register");
+                  delete_conn(conn);
+                }
+              }
+              if (changed & CONN_WRITABLE) {
+                // resume write
+                EV_SET(&kevs[0], conn->sock.fd, EVFILT_WRITE, EV_ADD | EV_CLEAR,
+                       0, 0, conn);
+                if (kevent(kq, &kevs[0], 1, NULL, 0, NULL) == -1) {
+                  perror("kevent-register");
+                  delete_conn(conn);
+                }
+              }
             }
-            handle_read(kq, new_conn);
           }
           break;
+        }
 
-        case TYPE_CONN:
+        case TYPE_CONN: {
+          struct conn_t *conn = (struct conn_t *)sock;
           switch (kevs[i].filter) {
             case EVFILT_READ:
-              handle_read(kq, conn);
+              conn->state |= CONN_READABLE;
+              int changed = handler(conn);
+              if (changed < 0) {
+                delete_conn(conn);
+              } else {
+                if (changed & CONN_WRITABLE) {
+                  // resume write
+                  EV_SET(&kevs[0], conn->sock.fd, EVFILT_WRITE,
+                         EV_ADD | EV_CLEAR, 0, 0, conn);
+                  if (kevent(kq, &kevs[0], 1, NULL, 0, NULL) == -1) {
+                    perror("kevent-register");
+                    delete_conn(conn);
+                  }
+                }
+                if (conn->state & CONN_READABLE) {
+                  // remove edge triggered read event
+                  EV_SET(&kevs[0], conn->sock.fd, EVFILT_READ, EV_DELETE, 0, 0,
+                         conn);
+                  if (kevent(kq, &kevs[0], 1, NULL, 0, NULL) == -1) {
+                    perror("kevent-register");
+                    delete_conn(conn);
+                  }
+                }
+              }
               break;
 
-            case EVFILT_WRITE:
-              handle_write(kq, conn);
+            case EVFILT_WRITE: {
+              conn->state |= CONN_WRITABLE;
+              int changed = handler(conn);
+              if (changed < 0) {
+                delete_conn(conn);
+              } else {
+                if (changed & CONN_READABLE) {
+                  // resume read
+                  EV_SET(&kevs[0], conn->sock.fd, EVFILT_READ,
+                         EV_ADD | EV_CLEAR, 0, 0, conn);
+                  if (kevent(kq, &kevs[0], 1, NULL, 0, NULL) == -1) {
+                    perror("kevent-register");
+                    delete_conn(conn);
+                  }
+                }
+                if (conn->state & CONN_WRITABLE) {
+                  // remove edge triggered write event
+                  EV_SET(&kevs[0], conn->sock.fd, EVFILT_WRITE, EV_DELETE, 0, 0,
+                         conn);
+                  if (kevent(kq, &kevs[0], 1, NULL, 0, NULL) == -1) {
+                    perror("kevent-register");
+                    delete_conn(conn);
+                  }
+                }
+              }
               break;
+            }
 
             default:
               break;
           }
           break;
+        }
 
         default:
           break;
