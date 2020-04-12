@@ -5,7 +5,7 @@ CC := gcc
 run: main
 	./main
 
-main: main.o
+main: main.o ev_kqueue.o
 
 .PHONY: clean
 clean:
